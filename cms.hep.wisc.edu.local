@@ -1,0 +1,9 @@
+# The following environment variable influences the symlink in
+# /cvmfs/cms.hep.wisc.edu/osg/app/cmssoft/cms/SITECONF/local.
+# We could point this to /cvmfs/cms.cern.ch/cms/SITECONF/T2_US_Wisconsin,
+# but I don't know how often that is updated.
+# We could also point it into AFS.  For now, I am directing it to
+# the cms.hep.wisc.edu repository.
+
+export CMS_LOCAL_SITE=/cvmfs/cms.hep.wisc.edu/osg/app/cmssoft/cms/SITECONF/T2_US_Wisconsin
+export CVMFS_HTTP_PROXY="http://cache01.hep.wisc.edu:80|http://cache02.hep.wisc.edu:80"

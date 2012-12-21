@@ -1,0 +1,50 @@
+#!/bin/sh
+
+CVMFS_SERVER_URL="$1"
+CVMFS_PUBLIC_KEY="$2"
+CVMFS_PUB_DIR="$3"
+MAILTO="$4"
+
+CVMFS_REPOSITORY_NAME=`basename $CVMFS_SERVER_URL`
+LOCK=/tmp/cvmfs-pull-cron.lock
+
+TEMP=$(mktemp -td "$(basename $0)-XXXXXXXXXXXX")
+trap "rm -rf ${TEMP}" EXIT
+cd "${TEMP}"
+
+die() {
+  echo $1 1>&2
+  exit 1
+}
+
+
+(
+flock -w 1 200 || exit
+
+mkdir -p $CVMFS_PUB_DIR || die "Failed to create $CVMFS_PUB_DIR."
+
+if ! [ -d $CVMFS_PUB_DIR/catalogs/.cvmfs_replica ]; then
+  initialize_cvmfs="-i"
+fi
+
+cvmfs_pull >> ./stdout 2>> ./stderr \
+  $initialize_cvmfs \
+  -d $CVMFS_PUB_DIR \
+  -u $CVMFS_SERVER_URL \
+  -m $CVMFS_REPOSITORY_NAME \
+  -k $CVMFS_PUBLIC_KEY \
+  -n 10 \
+  -z \
+  -e
+
+ret=$?
+
+if [ $ret -ne 0 ]; then
+    (
+    echo "$* returned $ret"
+    cat ./stdout 2>/dev/null
+    cat ./stderr
+    ) | mail -s "CVMFS pull failed" ${MAILTO}
+fi
+
+) 200>$LOCK

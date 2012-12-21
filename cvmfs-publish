@@ -1,0 +1,110 @@
+#!/bin/sh
+
+CVMFSUSER=${CVMFSUSER:-cvmfs}
+TEMP=$(mktemp -td "$(basename $0)-XXXXXXXXXXXX")
+trap "rm -rf ${TEMP}" EXIT
+cd "${TEMP}"
+
+LOCK=/var/lock/cvmfs-publish-cron
+SRC="$1"
+DST="$2"
+CVMFS_DATA="$(dirname "$DST")"
+FSCHANGES="${CVMFS_DATA}/ctrl/fschanges"
+MAILTO="$3"
+
+. /etc/cvmfs/server.conf || exit 1
+[ -f /etc/cvmfs/server.local ] && . /etc/cvmfs/server.local
+
+(
+flock -w 1 200 || exit
+
+# The SITECONF/local link must be different in the cvmfs shadow tree
+# than it is in the export shadow tree, because it uses the cvmfs-specific
+# trick of reference to an environment variable, allowing use of this
+# repository with different SITECONF settings.
+local_ln=`readlink ${DST}/osg/app/cmssoft/cms/SITECONF/local`
+if [ "$local_ln" != '$(CMS_LOCAL_SITE)' ]; then
+  ln -f -s '$(CMS_LOCAL_SITE)'  ${DST}/osg/app/cmssoft/cms/SITECONF/local
+fi
+
+# Apply fix for https://help.hep.wisc.edu/issue8057
+timeout="XNet.TransactionTimeout: 28800"
+find "${SRC}" -name system.rootrc | while read rootrc; do
+    grep -q "^$timeout" "$rootrc" ||\
+        printf "\n# Fix for https://help.hep.wisc.edu/issue8057\n$timeout\n" >> "$rootrc"
+done
+
+# Create subcatalogs.
+(cd "${SRC}"; (
+find ./ -mindepth 8 -maxdepth 8 -path "./osg/app/cmssoft/cms/slc*" -name "*CMSSW*" -type d -print0
+find ./ -mindepth 5 -maxdepth 5 -path "./osg/app/cmssoft/cms/slc*" -type d -print0
+) | xargs -r0 -I^ touch -a ^/.cvmfscatalog) 2>/dev/null
+
+# Run rsync as root -- it must be able to read all source files.
+
+# Work around a problem apparently caused by cvmfsd: disable
+# rsync's attempts to lchown symlinks, because these operations
+# produce entries in fschanges but do not update the ownership,
+# resulting in a new catalog every time cvmfs-publish is called.
+
+/cms/sw/cvmfs/rsync-no-lstat/rsync -og -i -rlptD \
+    --exclude /.cvmfscatalog \
+    --exclude /lost+found \
+    --exclude CVS/Template \
+    --exclude osg/app/cmssoft/cms/SITECONF/local \
+    --delete ${SRC} ${DST} >> ./stdout 2>> ./stderr
+ret=$?
+
+# Run publish when fschanges has registered a change. We inline publish() from
+# /usr/bin/cvmfs_server so that `cvmfs-sync` runs as root, which allows it to
+# read files with restrictive permissions. These files won't be readable by
+# CVMFS clients, but this approach still avoids read errors during rsync (above)
+# or sync (below).
+if [ -s "${FSCHANGES}" ]; then
+    (
+    # make a snapshot of the published repository
+    prev_revision=$(sqlite3 ${CVMFS_DATA}/pub/catalogs/.cvmfscatalog.working 'select value from properties where key = "revision";')
+    if ! [ -z "$prev_revision" ]; then
+      pub_archive="${CVMFS_DATA}/archives/pub${prev_revision}"
+      mkdir -p "$pub_archive"
+      cp -r -p "$CVMFS_DATA/pub/catalogs" "$pub_archive/"
+      # 2012-02-14: cvmfs01 has crashed twice, shortly after completing the following cp.
+      # Disabling it for now...
+      #cp -r -l "$CVMFS_DATA/pub/data" "$pub_archive/"
+
+      # keep a month of archives
+      #find "${CVMFS_DATA}/archives" -maxdepth 1 -type d -name 'pub*' -mtime +30 -exec rm -rf '{}' \;
+      # 2012-09-17: due to frequent updates to cvmfs, there is not room for 30 days of archives
+      find "${CVMFS_DATA}/archives" -maxdepth 1 -type d -name 'pub*' -mtime +7 -exec rm -rf '{}' \;
+    fi
+
+    name="${CVMFS_REPOSITORY_NAME}"
+    book_keeping="/srv/cvmfs/$name/ctrl/dirty_catalogs"
+
+    system_umask=""
+    if [ "x$CVMFS_SYSTEM_UMASK" == "xyes" ]; then
+      system_umask="-u"
+    fi
+
+    cvmfs-sync
+    for c in `cat $book_keeping`
+    do
+      cvmfs_sign -c /etc/cvmfs/keys/${name}.crt -k /etc/cvmfs/keys/$name.key -n $name $system_umask $c
+    done
+    cat /dev/null > $book_keeping
+    ) > ./stdout 2> ./publish-stderr
+
+    exec 200>&-
+    service cvmfsd restart > /dev/null 2>&1
+    ret=$?
+fi
+
+if [ $ret -ne 0 -o -s ./stderr -o -s ./publish-stderr ]; then
+    (
+    echo "$* returned $ret"
+    cat ./stdout 2>/dev/null
+    cat ./stderr
+    cat ./publish-stderr 2> /dev/null
+    ) | mail -s "CVMFS publish failed" ${MAILTO}
+fi
+) 200>${LOCK}
